@@ -6,3 +6,5 @@ langgraph
 httpx
 pytest
 pytest-asyncio
+groq
+python-dotenv
