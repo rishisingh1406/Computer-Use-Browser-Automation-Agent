@@ -1,0 +1,8 @@
+playwright
+pydantic
+pydantic-settings
+python-dotenv
+langgraph
+httpx
+pytest
+pytest-asyncio
