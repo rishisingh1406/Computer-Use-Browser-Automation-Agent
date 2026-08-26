@@ -3,36 +3,43 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-ActionType = Literal[
-    "navigate",
-    "click",
-    "type",
-    "scroll",
-    "done",
-]
-
-
 class BrowserAction(BaseModel):
-    action: ActionType
+    action: Literal[
+        "navigate",
+        "click",
+        "type",
+        "scroll",
+        "done",
+    ]
+
     url: str | None = None
     selector: str | None = None
     text: str | None = None
-    direction: Literal["up", "down"] | None = None
-    reason: str = Field(
-        description="Why this action is the next step"
-    )
+    direction: str | None = None
+    reason: str
 
 
 class BrowserObservation(BaseModel):
     url: str
     title: str
     text: str
-    screenshot_path: str | None = None
+    screenshot_path: str
 
 
-class AgentState(BaseModel):
-    task: str
-    observation: BrowserObservation | None = None
-    last_action: BrowserAction | None = None
-    step: int = 0
-    finished: bool = False
+class VisionTarget(BaseModel):
+    found: bool
+    x: int | None = None
+    y: int | None = None
+    reason: str
+
+
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+class VisionTarget(BaseModel):
+    found: bool
+    x: int | None = None
+    y: int | None = None
+    reason: str
