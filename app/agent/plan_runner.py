@@ -1,3 +1,4 @@
+
 from app.agent.loop import BrowserAgent
 
 from app.agent.models import (
@@ -10,17 +11,25 @@ from app.agent.models import (
 
 class PlanRunner:
     """
-    Executes a high-level BrowserPlan using the
-    existing BrowserAgent.
+    Executes a high-level BrowserPlan using BrowserAgent.
 
-    Planner:
-        Decides WHAT should happen.
+    Architecture:
 
-    PlanRunner:
-        Orchestrates the high-level steps.
+        PerSitePlanner
+              ↓
+        BrowserPlan
+              ↓
+        PlanRunner
+              ↓
+        BrowserAgent
+              ↓
+        BrowserTools
 
-    BrowserAgent:
-        Decides HOW to perform each browser task.
+    PerSitePlanner decides WHAT should happen.
+
+    PlanRunner orchestrates the high-level steps.
+
+    BrowserAgent decides HOW to perform each step.
     """
 
     def __init__(
@@ -38,6 +47,12 @@ class PlanRunner:
         plan: BrowserPlan,
     ) -> PlanRunResult:
 
+        # ------------------------------------------------------
+        # Validate before touching the browser
+        # ------------------------------------------------------
+
+        self._validate_plan(plan)
+
         results: list[PlanStepResult] = []
 
         print()
@@ -50,16 +65,13 @@ class PlanRunner:
         print(f"Steps: {len(plan.steps)}")
 
         # ------------------------------------------------------
-        # Validate plan before execution
+        # Execute steps sequentially
         # ------------------------------------------------------
 
-        self._validate_plan(plan)
-
-        # ------------------------------------------------------
-        # Execute each high-level step
-        # ------------------------------------------------------
-
-        for index, step in enumerate(plan.steps, start=1):
+        for index, step in enumerate(
+            plan.steps,
+            start=1,
+        ):
 
             print()
             print("=" * 70)
@@ -81,7 +93,7 @@ class PlanRunner:
                 )
 
             # --------------------------------------------------
-            # Run step
+            # Execute one high-level step
             # --------------------------------------------------
 
             result = await self._run_step(step)
@@ -89,7 +101,7 @@ class PlanRunner:
             results.append(result)
 
             # --------------------------------------------------
-            # Stop immediately if step failed
+            # Stop immediately on failure
             # --------------------------------------------------
 
             if not result.finished:
@@ -143,6 +155,13 @@ class PlanRunner:
     def _validate_plan(
         plan: BrowserPlan,
     ) -> None:
+        """
+        Validate structural properties required by PlanRunner.
+
+        BrowserPlan already validates the Pydantic schema.
+
+        This method validates execution-specific invariants.
+        """
 
         if not plan.steps:
             raise ValueError(
@@ -177,6 +196,10 @@ class PlanRunner:
         print()
         print("Running browser agent...")
 
+        # ------------------------------------------------------
+        # Execute browser agent
+        # ------------------------------------------------------
+
         try:
 
             state = await self.browser_agent.run(
@@ -205,23 +228,53 @@ class PlanRunner:
         final_title = None
         extracted_text = None
 
-        if state.observation:
+        observation = getattr(
+            state,
+            "observation",
+            None,
+        )
 
-            final_url = state.observation.url
-            final_title = state.observation.title
+        if observation:
 
-            # Only treat the observation as extracted
-            # content for an EXTRACT step.
+            final_url = getattr(
+                observation,
+                "url",
+                None,
+            )
+
+            final_title = getattr(
+                observation,
+                "title",
+                None,
+            )
+
+            # Only EXTRACT steps expose page text
+            # as the extracted result.
             if step.action == "extract":
-                extracted_text = (
-                    state.observation.text
+
+                extracted_text = getattr(
+                    observation,
+                    "text",
+                    None,
                 )
 
         # ------------------------------------------------------
-        # Detect unsuccessful agent execution
+        # Determine success
         # ------------------------------------------------------
 
-        if not state.finished:
+        finished = getattr(
+            state,
+            "finished",
+            False,
+        )
+
+        error = getattr(
+            state,
+            "error",
+            None,
+        )
+
+        if not finished:
 
             return PlanStepResult(
                 step_id=step.step_id,
@@ -232,10 +285,15 @@ class PlanRunner:
                 final_title=final_title,
                 extracted_text=extracted_text,
                 error=(
-                    state.error
-                    or "Browser agent did not finish the subtask"
+                    error
+                    or "Browser agent did not finish "
+                       "the subtask"
                 ),
             )
+
+        # ------------------------------------------------------
+        # Successful step
+        # ------------------------------------------------------
 
         return PlanStepResult(
             step_id=step.step_id,
@@ -245,7 +303,7 @@ class PlanRunner:
             final_url=final_url,
             final_title=final_title,
             extracted_text=extracted_text,
-            error=state.error,
+            error=error,
         )
 
     # ==========================================================
@@ -256,6 +314,12 @@ class PlanRunner:
     def _build_subtask(
         step: PlanStep,
     ) -> str:
+        """
+        Convert a high-level PlanStep into a task
+        that BrowserAgent can execute.
+
+        PlanRunner does not perform browser operations itself.
+        """
 
         return f"""
 You are executing ONE subtask of a larger
@@ -286,6 +350,7 @@ IMPORTANT RULES:
 6. If the requested result cannot be found,
    clearly report the failure instead of
    pretending the task succeeded.
+7. Do not attempt the next plan step.
 
 ACTION-SPECIFIC INSTRUCTIONS:
 
@@ -296,11 +361,11 @@ NAVIGATE:
 
 SEARCH:
 - Locate the requested information.
-- Use the site's search/navigation interface
+- Use the site's search or navigation interface
   when appropriate.
 - Navigate to the most relevant page.
 - Do not extract unrelated information.
-- Stop once the relevant page/information
+- Stop once the relevant page or information
   has been located.
 
 EXTRACT:
@@ -333,7 +398,7 @@ Do not attempt the next plan step.
             return None
 
         # ------------------------------------------------------
-        # Prefer the successful extraction result.
+        # Prefer successful extraction
         # ------------------------------------------------------
 
         for result in reversed(results):
@@ -346,27 +411,31 @@ Do not attempt the next plan step.
                 return result.extracted_text
 
         # ------------------------------------------------------
-        # If there was no extraction step, return
-        # the final successful observation information.
+        # No extraction step
+        #
+        # Return useful information about the final
+        # successful browser state.
         # ------------------------------------------------------
 
         last_result = results[-1]
 
-        if last_result.finished:
+        if not last_result.finished:
+            return None
 
-            if last_result.extracted_text:
-                return last_result.extracted_text
+        if last_result.extracted_text:
+            return last_result.extracted_text
 
-            if last_result.final_title:
-                return (
-                    f"Completed at: "
-                    f"{last_result.final_title}"
-                )
+        if last_result.final_title:
+            return (
+                f"Completed at: "
+                f"{last_result.final_title}"
+            )
 
-            if last_result.final_url:
-                return (
-                    f"Completed at: "
-                    f"{last_result.final_url}"
-                )
+        if last_result.final_url:
+            return (
+                f"Completed at: "
+                f"{last_result.final_url}"
+            )
 
         return None
+

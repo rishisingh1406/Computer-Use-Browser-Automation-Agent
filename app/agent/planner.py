@@ -1,5 +1,8 @@
+
+import asyncio
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -14,8 +17,7 @@ load_dotenv()
 
 class PerSitePlanner:
     """
-    Generates a high-level browser execution plan
-    for a specific website.
+    High-level planner for browser tasks.
 
     Responsibility:
         Decide WHAT needs to happen.
@@ -25,15 +27,22 @@ class PerSitePlanner:
         - choose CSS selectors
         - click elements
         - type text
-        - execute actions
+        - scroll
+        - execute browser actions
 
-    Execution is handled later by PlanRunner
-    and BrowserAgent.
+    Execution is handled by PlanRunner and BrowserAgent.
     """
+
+    DEFAULT_MODEL = "qwen/qwen3.6-27b"
+
+    MAX_RETRIES = 3
+
+    # Used when Groq does not expose a retry delay directly.
+    DEFAULT_RETRY_DELAY = 1.0
 
     def __init__(
         self,
-        model: str = "qwen/qwen3.6-27b",
+        model: str | None = None,
     ):
         api_key = os.getenv("GROQ_API_KEY")
 
@@ -46,7 +55,13 @@ class PerSitePlanner:
             api_key=api_key
         )
 
-        self.model = model
+        self.model = (
+            model
+            or os.getenv(
+                "GROQ_PLANNER_MODEL"
+            )
+            or self.DEFAULT_MODEL
+        )
 
     # ==========================================================
     # GENERATE PLAN
@@ -76,170 +91,59 @@ class PerSitePlanner:
             )
 
         # ------------------------------------------------------
-        # Planner system prompt
+        # Compact system prompt
+        #
+        # Keep this intentionally small.
+        # Planner calls consume input TPM.
         # ------------------------------------------------------
 
         system_prompt = """
-You are a high-level browser-agent task planner.
+You are a high-level browser task planner.
 
-Your job is to convert a user's goal into a
-small, reliable sequence of browser subtasks
-for ONE specific website.
+Convert the user's goal into the smallest reliable
+sequence of high-level browser subtasks for ONE website.
 
-You are NOT executing the browser.
+You decide WHAT must happen, not HOW the browser performs it.
 
-You are ONLY deciding WHAT needs to happen.
+Allowed actions:
+- navigate: open the requested website or relevant page
+- search: locate the requested information on the website
+- extract: collect the requested information
 
-The resulting plan will be executed by:
+Never use:
+click, type, scroll, screenshot, selector, wait, done.
 
-PerSitePlanner
-    ↓
-BrowserPlan
-    ↓
-PlanRunner
-    ↓
-BrowserAgent
-    ↓
-Browser tools
+Rules:
+1. Use sequential step_id values starting at 1.
+2. Use only navigate, search, extract.
+3. Start with navigate when the website must be opened.
+4. Use search when information must be located.
+5. Use extract for the requested final information.
+6. Extract must be the final step for information-retrieval tasks.
+7. Keep the plan as small as reliably possible.
+8. Do not describe low-level browser operations.
+9. Do not invent website information.
+10. Preserve the supplied goal and site exactly.
+11. Every step needs a useful description.
+12. target identifies the relevant page or information.
+13. expected_result describes the successful outcome.
 
-==================================================
-ALLOWED HIGH-LEVEL ACTIONS
-==================================================
-
-Every plan step MUST use exactly one of:
-
-- navigate
-- search
-- extract
-
-Do NOT use:
-
-- click
-- type
-- scroll
-- screenshot
-- selector
-- wait
-- done
-
-Those are low-level browser operations handled
-by the BrowserAgent.
-
-==================================================
-PLANNING PRINCIPLES
-==================================================
-
-1. Start with navigation when the task requires
-   opening the target website.
-
-2. Use SEARCH when information must be located
-   within the website.
-
-3. Use EXTRACT when the requested information
-   has been located and needs to be collected.
-
-4. Keep subtasks small and independently
-   understandable.
-
-5. Each step must have one clear purpose.
-
-6. Do not combine unrelated operations into one
-   step.
-
-7. Do not describe CSS selectors.
-
-8. Do not describe mouse coordinates.
-
-9. Do not specify click/type/scroll operations.
-
-10. Do not invent information about the website.
-
-11. Prefer the smallest reliable plan.
-
-12. The final step should normally be EXTRACT
-    for information-retrieval tasks.
-
-==================================================
-STEP DEFINITIONS
-==================================================
-
-NAVIGATE:
-
-Open the requested website or relevant page.
-
-SEARCH:
-
-Locate the page, product, document, category,
-or information requested by the user.
-
-EXTRACT:
-
-Read and return the specific information the
-user requested.
-
-==================================================
-PLAN STRUCTURE
-==================================================
-
-Return ONLY valid JSON.
-
-Do not return:
-
-- markdown
-- code fences
-- explanations
-- reasoning
-- <think> tags
-
-The JSON must have exactly this structure:
+Return ONLY valid JSON in this structure:
 
 {
-    "goal": "...",
-    "site": "...",
-    "steps": [
-        {
-            "step_id": 1,
-            "action": "navigate",
-            "description": "...",
-            "target": "...",
-            "expected_result": "..."
-        }
-    ]
+  "goal": "...",
+  "site": "...",
+  "steps": [
+    {
+      "step_id": 1,
+      "action": "navigate",
+      "description": "...",
+      "target": "...",
+      "expected_result": "..."
+    }
+  ]
 }
-
-==================================================
-PLAN RULES
-==================================================
-
-1. step_id MUST start at 1.
-
-2. step_id MUST increase sequentially.
-
-3. Use only:
-   navigate, search, extract
-
-4. Every step MUST have a useful description.
-
-5. target should identify the page, information,
-   or destination relevant to that step.
-
-6. expected_result should describe what successful
-   completion of the step should produce.
-
-7. Do not include low-level browser actions.
-
-8. Do not include unnecessary steps.
-
-9. Do not attempt to perform the user's goal.
-
-10. Only describe the plan required to accomplish it.
-
-11. Preserve the user's goal exactly in the
-    "goal" field.
-
-12. Preserve the requested website exactly in
-    the "site" field.
-"""
+""".strip()
 
         # ------------------------------------------------------
         # User prompt
@@ -252,51 +156,25 @@ WEBSITE:
 USER GOAL:
 {goal}
 
-Create the smallest reliable high-level browser
-plan required to accomplish this goal on this
-specific website.
+Create the smallest reliable high-level plan required
+to accomplish this goal on this website.
 
-For a typical information-retrieval task,
-the plan may look like:
+For information retrieval, normally use:
+navigate -> search -> extract
 
-1. Navigate to the website.
-2. Search for the requested information.
-3. Extract the requested information.
-
-Only include steps that are actually necessary.
+Only include necessary steps.
 
 Return ONLY the JSON object.
-"""
+""".strip()
 
         # ------------------------------------------------------
-        # Call LLM
+        # Call LLM with retry handling
         # ------------------------------------------------------
 
-        try:
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={
-                    "type": "json_object"
-                },
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-            )
-
-        except Exception as exc:
-
-            raise RuntimeError(
-                f"Planner LLM request failed: {exc}"
-            ) from exc
+        response = await self._create_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
 
         # ------------------------------------------------------
         # Get response content
@@ -325,27 +203,23 @@ Return ONLY the JSON object.
         # ------------------------------------------------------
 
         try:
-
             data = json.loads(content)
 
         except json.JSONDecodeError as exc:
-
             raise ValueError(
                 "Groq returned invalid planner JSON."
             ) from exc
 
         # ------------------------------------------------------
-        # Validate against shared BrowserPlan model
+        # Validate against BrowserPlan
         # ------------------------------------------------------
 
         try:
-
             plan = BrowserPlan.model_validate(
                 data
             )
 
         except Exception as exc:
-
             raise ValueError(
                 "Groq returned an invalid browser plan: "
                 f"{data}"
@@ -362,6 +236,226 @@ Return ONLY the JSON object.
         )
 
         return plan
+
+    # ==========================================================
+    # GROQ COMPLETION WITH RATE-LIMIT RETRIES
+    # ==========================================================
+
+    async def _create_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ):
+        """
+        Call Groq with controlled retry handling.
+
+        Groq can temporarily return HTTP 429 when the
+        organization's TPM limit is exceeded.
+
+        The retry delay is extracted from the error message
+        when possible.
+        """
+
+        for attempt in range(
+            self.MAX_RETRIES + 1
+        ):
+
+            try:
+
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=0,
+                    response_format={
+                        "type": "json_object"
+                    },
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    ],
+                )
+
+            except Exception as exc:
+
+                # --------------------------------------------------
+                # Detect Groq 429 rate limit
+                # --------------------------------------------------
+
+                if not self._is_rate_limit_error(
+                    exc
+                ):
+                    raise RuntimeError(
+                        f"Planner LLM request failed: {exc}"
+                    ) from exc
+
+                # --------------------------------------------------
+                # No retries remaining
+                # --------------------------------------------------
+
+                if attempt >= self.MAX_RETRIES:
+
+                    raise RuntimeError(
+                        "Planner LLM request failed after "
+                        f"{self.MAX_RETRIES + 1} attempts "
+                        f"because of Groq rate limiting: {exc}"
+                    ) from exc
+
+                # --------------------------------------------------
+                # Determine retry delay
+                # --------------------------------------------------
+
+                delay = self._extract_retry_delay(
+                    exc
+                )
+
+                # Add a small progressive backoff so that
+                # repeated calls do not hammer the API.
+                delay += attempt * 0.5
+
+                print()
+                print(
+                    "PLANNER RATE LIMIT"
+                )
+
+                print(
+                    f"Attempt: {attempt + 1}/"
+                    f"{self.MAX_RETRIES + 1}"
+                )
+
+                print(
+                    f"Retrying in {delay:.2f} seconds..."
+                )
+
+                await asyncio.sleep(
+                    delay
+                )
+
+        # This should never be reached.
+        raise RuntimeError(
+            "Planner LLM request failed unexpectedly."
+        )
+
+    # ==========================================================
+    # RATE LIMIT DETECTION
+    # ==========================================================
+
+    @staticmethod
+    def _is_rate_limit_error(
+        exc: Exception,
+    ) -> bool:
+        """
+        Determine whether an exception represents
+        a Groq HTTP 429 rate limit.
+        """
+
+        # Groq SDK exposes RateLimitError, but checking
+        # the status code/message makes this resilient
+        # across SDK versions.
+
+        status_code = getattr(
+            exc,
+            "status_code",
+            None,
+        )
+
+        if status_code == 429:
+            return True
+
+        response = getattr(
+            exc,
+            "response",
+            None,
+        )
+
+        if response is not None:
+
+            response_status = getattr(
+                response,
+                "status_code",
+                None,
+            )
+
+            if response_status == 429:
+                return True
+
+        message = str(exc).lower()
+
+        return (
+            "rate limit" in message
+            or "rate_limit" in message
+            or "429" in message
+            or "tokens per minute" in message
+        )
+
+    # ==========================================================
+    # EXTRACT RETRY DELAY
+    # ==========================================================
+
+    @staticmethod
+    def _extract_retry_delay(
+        exc: Exception,
+    ) -> float:
+        """
+        Extract retry delay from a Groq error.
+
+        Example Groq message:
+
+            Please try again in 420ms.
+
+        Returns:
+            delay in seconds.
+        """
+
+        message = str(exc)
+
+        # ------------------------------------------------------
+        # Milliseconds
+        # ------------------------------------------------------
+
+        match = re.search(
+            r"try again in\s+(\d+(?:\.\d+)?)\s*ms",
+            message,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            milliseconds = float(
+                match.group(1)
+            )
+
+            return max(
+                milliseconds / 1000.0,
+                0.1,
+            )
+
+        # ------------------------------------------------------
+        # Seconds
+        # ------------------------------------------------------
+
+        match = re.search(
+            r"try again in\s+(\d+(?:\.\d+)?)\s*s",
+            message,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            return max(
+                float(match.group(1)),
+                0.1,
+            )
+
+        # ------------------------------------------------------
+        # Default
+        # ------------------------------------------------------
+
+        return PerSitePlanner.DEFAULT_RETRY_DELAY
 
     # ==========================================================
     # VALIDATE PLAN
@@ -460,10 +554,12 @@ Return ONLY the JSON object.
                 "navigate",
                 "search",
             }:
+
                 if (
                     step.target is not None
                     and not step.target.strip()
                 ):
+
                     raise ValueError(
                         f"Step {step.step_id} has "
                         "an empty target."
@@ -477,29 +573,29 @@ Return ONLY the JSON object.
                 step.expected_result is not None
                 and not step.expected_result.strip()
             ):
+
                 raise ValueError(
                     f"Step {step.step_id} has "
                     "an empty expected_result."
                 )
 
         # ------------------------------------------------------
-        # Information-retrieval plans should end with
-        # extraction.
-        #
-        # We don't force every possible task to end
-        # with extract, but if the plan contains an
-        # extract step it should be the final step.
+        # Extract must be final
         # ------------------------------------------------------
 
         extract_indexes = [
             index
-            for index, step in enumerate(plan.steps)
+            for index, step in enumerate(
+                plan.steps
+            )
             if step.action == "extract"
         ]
 
         if extract_indexes:
 
-            last_index = len(plan.steps) - 1
+            last_index = len(
+                plan.steps
+            ) - 1
 
             if extract_indexes[-1] != last_index:
 
@@ -507,3 +603,4 @@ Return ONLY the JSON object.
                     "The extract step must be the "
                     "final step of the plan."
                 )
+
