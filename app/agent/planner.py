@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import os
@@ -72,6 +71,16 @@ class PerSitePlanner:
         goal: str,
         site: str,
     ) -> BrowserPlan:
+        """
+        Generate and validate a high-level browser plan.
+
+        The planner is deliberately constrained to three
+        high-level actions:
+
+            navigate -> search -> extract
+
+        Low-level browser operations are handled elsewhere.
+        """
 
         # ------------------------------------------------------
         # Validate input
@@ -91,55 +100,72 @@ class PerSitePlanner:
             )
 
         # ------------------------------------------------------
-        # Compact system prompt
+        # System prompt
         #
-        # Keep this intentionally small.
-        # Planner calls consume input TPM.
+        # IMPORTANT:
+        # Keep the JSON schema extremely simple.
+        #
+        # Groq's json_object mode can reject generation when
+        # the model fails to produce a valid JSON object.
         # ------------------------------------------------------
 
         system_prompt = """
 You are a high-level browser task planner.
 
-Convert the user's goal into the smallest reliable
-sequence of high-level browser subtasks for ONE website.
+Your job is to convert the user's goal into the smallest
+reliable sequence of high-level browser subtasks for ONE website.
 
-You decide WHAT must happen, not HOW the browser performs it.
+You decide WHAT needs to happen, not HOW the browser performs it.
 
 Allowed actions:
-- navigate: open the requested website or relevant page
-- search: locate the requested information on the website
-- extract: collect the requested information
+
+- navigate
+- search
+- extract
 
 Never use:
-click, type, scroll, screenshot, selector, wait, done.
 
-Rules:
+- click
+- type
+- scroll
+- screenshot
+- selector
+- wait
+- done
+
+Planning rules:
+
 1. Use sequential step_id values starting at 1.
-2. Use only navigate, search, extract.
+2. Use only navigate, search, and extract.
 3. Start with navigate when the website must be opened.
 4. Use search when information must be located.
 5. Use extract for the requested final information.
-6. Extract must be the final step for information-retrieval tasks.
+6. For information retrieval, extract must be the final step.
 7. Keep the plan as small as reliably possible.
 8. Do not describe low-level browser operations.
 9. Do not invent website information.
-10. Preserve the supplied goal and site exactly.
-11. Every step needs a useful description.
-12. target identifies the relevant page or information.
-13. expected_result describes the successful outcome.
+10. Preserve the supplied goal exactly.
+11. Preserve the supplied site exactly.
+12. Every step must have a useful description.
+13. target identifies the relevant page or information.
+14. expected_result describes the successful outcome.
+15. Return exactly one JSON object.
+16. Do not return markdown.
+17. Do not return explanations.
+18. Do not return code fences.
 
-Return ONLY valid JSON in this structure:
+The JSON object must have this structure:
 
 {
-  "goal": "...",
-  "site": "...",
+  "goal": "the supplied goal",
+  "site": "the supplied site",
   "steps": [
     {
       "step_id": 1,
       "action": "navigate",
-      "description": "...",
-      "target": "...",
-      "expected_result": "..."
+      "description": "open the website",
+      "target": "the supplied website",
+      "expected_result": "the website is open"
     }
   ]
 }
@@ -149,26 +175,19 @@ Return ONLY valid JSON in this structure:
         # User prompt
         # ------------------------------------------------------
 
-        user_prompt = f"""
-WEBSITE:
-{site}
-
-USER GOAL:
-{goal}
-
-Create the smallest reliable high-level plan required
-to accomplish this goal on this website.
-
-For information retrieval, normally use:
-navigate -> search -> extract
-
-Only include necessary steps.
-
-Return ONLY the JSON object.
-""".strip()
+        user_prompt = (
+            f"WEBSITE:\n{site}\n\n"
+            f"USER GOAL:\n{goal}\n\n"
+            "Create the smallest reliable high-level plan "
+            "required to accomplish this goal on this website.\n\n"
+            "For information retrieval, normally use:\n"
+            "navigate -> search -> extract\n\n"
+            "Only include necessary steps.\n\n"
+            "Return exactly one JSON object."
+        )
 
         # ------------------------------------------------------
-        # Call LLM with retry handling
+        # Call LLM
         # ------------------------------------------------------
 
         response = await self._create_completion(
@@ -202,13 +221,9 @@ Return ONLY the JSON object.
         # Parse JSON
         # ------------------------------------------------------
 
-        try:
-            data = json.loads(content)
-
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "Groq returned invalid planner JSON."
-            ) from exc
+        data = self._parse_json(
+            content
+        )
 
         # ------------------------------------------------------
         # Validate against BrowserPlan
@@ -218,7 +233,6 @@ Return ONLY the JSON object.
             plan = BrowserPlan.model_validate(
                 data
             )
-
         except Exception as exc:
             raise ValueError(
                 "Groq returned an invalid browser plan: "
@@ -238,7 +252,84 @@ Return ONLY the JSON object.
         return plan
 
     # ==========================================================
-    # GROQ COMPLETION WITH RATE-LIMIT RETRIES
+    # PARSE JSON
+    # ==========================================================
+
+    @staticmethod
+    def _parse_json(
+        content: str,
+    ) -> dict:
+        """
+        Parse planner JSON safely.
+
+        Handles:
+            1. normal JSON
+            2. accidental markdown code fences
+            3. surrounding whitespace
+
+        Does not attempt to invent or repair planner data.
+        """
+
+        cleaned = content.strip()
+
+        # ------------------------------------------------------
+        # First attempt: direct JSON
+        # ------------------------------------------------------
+
+        try:
+            data = json.loads(
+                cleaned
+            )
+
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "Planner response must be a JSON object."
+                )
+
+            return data
+
+        except json.JSONDecodeError:
+            pass
+
+        # ------------------------------------------------------
+        # Second attempt: remove markdown code fences
+        # ------------------------------------------------------
+
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        cleaned = re.sub(
+            r"\s*```$",
+            "",
+            cleaned,
+        )
+
+        cleaned = cleaned.strip()
+
+        try:
+            data = json.loads(
+                cleaned
+            )
+
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "Planner response must be a JSON object."
+                )
+
+            return data
+
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Groq returned invalid planner JSON:\n"
+                f"{content}"
+            ) from exc
+
+    # ==========================================================
+    # GROQ COMPLETION WITH RETRIES
     # ==========================================================
 
     async def _create_completion(
@@ -249,25 +340,27 @@ Return ONLY the JSON object.
         """
         Call Groq with controlled retry handling.
 
-        Groq can temporarily return HTTP 429 when the
-        organization's TPM limit is exceeded.
+        Retries are performed for rate limiting.
 
-        The retry delay is extracted from the error message
-        when possible.
+        JSON validation errors are not retried because they are
+        request-generation failures rather than temporary
+        transport/rate-limit failures.
         """
 
         for attempt in range(
             self.MAX_RETRIES + 1
         ):
-
             try:
 
                 return self.client.chat.completions.create(
                     model=self.model,
+
                     temperature=0,
+
                     response_format={
                         "type": "json_object"
                     },
+
                     messages=[
                         {
                             "role": "system",
@@ -283,59 +376,58 @@ Return ONLY the JSON object.
             except Exception as exc:
 
                 # --------------------------------------------------
-                # Detect Groq 429 rate limit
+                # Detect Groq rate limit
                 # --------------------------------------------------
 
-                if not self._is_rate_limit_error(
+                if self._is_rate_limit_error(
                     exc
                 ):
-                    raise RuntimeError(
-                        f"Planner LLM request failed: {exc}"
-                    ) from exc
+
+                    if attempt >= self.MAX_RETRIES:
+                        raise RuntimeError(
+                            "Planner LLM request failed after "
+                            f"{self.MAX_RETRIES + 1} attempts "
+                            "because of Groq rate limiting: "
+                            f"{exc}"
+                        ) from exc
+
+                    delay = self._extract_retry_delay(
+                        exc
+                    )
+
+                    # Progressive backoff.
+                    delay += attempt * 0.5
+
+                    print()
+                    print(
+                        "PLANNER RATE LIMIT"
+                    )
+                    print(
+                        f"Attempt: {attempt + 1}/"
+                        f"{self.MAX_RETRIES + 1}"
+                    )
+                    print(
+                        f"Retrying in {delay:.2f} seconds..."
+                    )
+
+                    await asyncio.sleep(
+                        delay
+                    )
+
+                    continue
 
                 # --------------------------------------------------
-                # No retries remaining
+                # Non-rate-limit error
                 # --------------------------------------------------
 
-                if attempt >= self.MAX_RETRIES:
+                raise RuntimeError(
+                    f"Planner LLM request failed: {exc}"
+                ) from exc
 
-                    raise RuntimeError(
-                        "Planner LLM request failed after "
-                        f"{self.MAX_RETRIES + 1} attempts "
-                        f"because of Groq rate limiting: {exc}"
-                    ) from exc
+        # ------------------------------------------------------
+        # Should never be reached.
+        # ------------------------------------------------------
 
-                # --------------------------------------------------
-                # Determine retry delay
-                # --------------------------------------------------
-
-                delay = self._extract_retry_delay(
-                    exc
-                )
-
-                # Add a small progressive backoff so that
-                # repeated calls do not hammer the API.
-                delay += attempt * 0.5
-
-                print()
-                print(
-                    "PLANNER RATE LIMIT"
-                )
-
-                print(
-                    f"Attempt: {attempt + 1}/"
-                    f"{self.MAX_RETRIES + 1}"
-                )
-
-                print(
-                    f"Retrying in {delay:.2f} seconds..."
-                )
-
-                await asyncio.sleep(
-                    delay
-                )
-
-        # This should never be reached.
         raise RuntimeError(
             "Planner LLM request failed unexpectedly."
         )
@@ -353,9 +445,9 @@ Return ONLY the JSON object.
         a Groq HTTP 429 rate limit.
         """
 
-        # Groq SDK exposes RateLimitError, but checking
-        # the status code/message makes this resilient
-        # across SDK versions.
+        # ------------------------------------------------------
+        # Direct status code
+        # ------------------------------------------------------
 
         status_code = getattr(
             exc,
@@ -365,6 +457,10 @@ Return ONLY the JSON object.
 
         if status_code == 429:
             return True
+
+        # ------------------------------------------------------
+        # Nested response status code
+        # ------------------------------------------------------
 
         response = getattr(
             exc,
@@ -383,7 +479,13 @@ Return ONLY the JSON object.
             if response_status == 429:
                 return True
 
-        message = str(exc).lower()
+        # ------------------------------------------------------
+        # Message fallback
+        # ------------------------------------------------------
+
+        message = str(
+            exc
+        ).lower()
 
         return (
             "rate limit" in message
@@ -403,15 +505,21 @@ Return ONLY the JSON object.
         """
         Extract retry delay from a Groq error.
 
-        Example Groq message:
+        Supports examples such as:
 
             Please try again in 420ms.
+
+        or:
+
+            Please try again in 2s.
 
         Returns:
             delay in seconds.
         """
 
-        message = str(exc)
+        message = str(
+            exc
+        )
 
         # ------------------------------------------------------
         # Milliseconds
@@ -447,7 +555,9 @@ Return ONLY the JSON object.
         if match:
 
             return max(
-                float(match.group(1)),
+                float(
+                    match.group(1)
+                ),
                 0.1,
             )
 
@@ -467,13 +577,18 @@ Return ONLY the JSON object.
         goal: str,
         site: str,
     ) -> None:
+        """
+        Validate the planner output beyond Pydantic validation.
+
+        This protects the execution layer from malformed or
+        logically unsafe plans.
+        """
 
         # ------------------------------------------------------
         # Goal validation
         # ------------------------------------------------------
 
         if plan.goal != goal:
-
             raise ValueError(
                 "Planner returned an incorrect goal."
             )
@@ -483,7 +598,6 @@ Return ONLY the JSON object.
         # ------------------------------------------------------
 
         if plan.site != site:
-
             raise ValueError(
                 "Planner returned an incorrect site."
             )
@@ -493,7 +607,6 @@ Return ONLY the JSON object.
         # ------------------------------------------------------
 
         if not plan.steps:
-
             raise ValueError(
                 "Planner returned an empty plan."
             )
@@ -515,14 +628,13 @@ Return ONLY the JSON object.
         ]
 
         if actual_ids != expected_ids:
-
             raise ValueError(
                 "Planner step IDs must be sequential "
                 "starting from 1."
             )
 
         # ------------------------------------------------------
-        # Step validation
+        # Allowed actions
         # ------------------------------------------------------
 
         allowed_actions = {
@@ -531,23 +643,29 @@ Return ONLY the JSON object.
             "extract",
         }
 
+        # ------------------------------------------------------
+        # Validate each step
+        # ------------------------------------------------------
+
         for step in plan.steps:
 
             if step.action not in allowed_actions:
-
                 raise ValueError(
                     f"Step {step.step_id} uses invalid "
                     f"action: {step.action}"
                 )
 
-            if not step.description.strip():
+            # --------------------------------------------------
+            # Description
+            # --------------------------------------------------
 
+            if not step.description.strip():
                 raise ValueError(
                     f"Step {step.step_id} has no description."
                 )
 
             # --------------------------------------------------
-            # Target validation
+            # Target
             # --------------------------------------------------
 
             if step.action in {
@@ -559,21 +677,19 @@ Return ONLY the JSON object.
                     step.target is not None
                     and not step.target.strip()
                 ):
-
                     raise ValueError(
                         f"Step {step.step_id} has "
                         "an empty target."
                     )
 
             # --------------------------------------------------
-            # Expected result validation
+            # Expected result
             # --------------------------------------------------
 
             if (
                 step.expected_result is not None
                 and not step.expected_result.strip()
             ):
-
                 raise ValueError(
                     f"Step {step.step_id} has "
                     "an empty expected_result."
@@ -593,14 +709,12 @@ Return ONLY the JSON object.
 
         if extract_indexes:
 
-            last_index = len(
-                plan.steps
-            ) - 1
+            last_index = (
+                len(plan.steps) - 1
+            )
 
             if extract_indexes[-1] != last_index:
-
                 raise ValueError(
                     "The extract step must be the "
                     "final step of the plan."
                 )
-

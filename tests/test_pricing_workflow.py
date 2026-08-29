@@ -89,9 +89,9 @@ async def test_day_96_pricing_workflow():
         )
 
         result = await workflow.run(
-            goal="Get GitHub Copilot pricing",
-            site="https://github.com",
-            product="GitHub Copilot",
+            goal="Get GitLab pricing",
+            site="https://about.gitlab.com/pricing/",
+            product="GitLab",
         )
 
         # ==================================================
@@ -105,12 +105,12 @@ async def test_day_96_pricing_workflow():
 
         assert (
             result.site
-            == "https://github.com"
+            == "https://about.gitlab.com/pricing/"
         )
 
         assert (
             result.product
-            == "GitHub Copilot"
+            == "GitLab"
         )
 
         assert isinstance(
