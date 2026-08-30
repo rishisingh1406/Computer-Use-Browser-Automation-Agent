@@ -1,17 +1,16 @@
-
 from app.agent.loop import BrowserAgent
-
 from app.agent.models import (
     BrowserPlan,
     PlanRunResult,
     PlanStep,
     PlanStepResult,
 )
+from app.auth.handler import SecureLoginHandler
 
 
 class PlanRunner:
     """
-    Executes a high-level BrowserPlan using BrowserAgent.
+    Executes a high-level BrowserPlan.
 
     Architecture:
 
@@ -20,36 +19,50 @@ class PlanRunner:
         BrowserPlan
               ↓
         PlanRunner
-              ↓
-        BrowserAgent
-              ↓
-        BrowserTools
+          /        \
+         /          \
+    normal step    login step
+        ↓              ↓
+    BrowserAgent   SecureLoginHandler
+        ↓              ↓
+    ActionExecutor  CredentialProvider
+        ↓              ↓
+    BrowserTools   LoginExecutor
+                       ↓
+                  BrowserTools
 
-    PerSitePlanner decides WHAT should happen.
+    Security boundary:
 
-    PlanRunner orchestrates the high-level steps.
+        Login credentials NEVER enter:
 
-    BrowserAgent decides HOW to perform each step.
+            - BrowserAction
+            - BrowserAgent
+            - LLM prompts
+            - LLM responses
+            - BrowserObservation
+            - AgentState
+            - PlanStep
+            - PlanRunResult
     """
 
     def __init__(
         self,
         browser_agent: BrowserAgent,
+        login_handler: SecureLoginHandler,
     ):
         self.browser_agent = browser_agent
-
-    # ==========================================================
-    # RUN COMPLETE PLAN
-    # ==========================================================
+        self.login_handler = login_handler
 
     async def run(
         self,
         plan: BrowserPlan,
     ) -> PlanRunResult:
+        """
+        Execute all high-level plan steps sequentially.
 
-        # ------------------------------------------------------
-        # Validate before touching the browser
-        # ------------------------------------------------------
+        Login steps are handled exclusively by the trusted
+        authentication layer.
+        """
 
         self._validate_plan(plan)
 
@@ -59,20 +72,14 @@ class PlanRunner:
         print("=" * 70)
         print("EXECUTING BROWSER PLAN")
         print("=" * 70)
-
         print(f"Goal: {plan.goal}")
         print(f"Site: {plan.site}")
         print(f"Steps: {len(plan.steps)}")
-
-        # ------------------------------------------------------
-        # Execute steps sequentially
-        # ------------------------------------------------------
 
         for index, step in enumerate(
             plan.steps,
             start=1,
         ):
-
             print()
             print("=" * 70)
             print(
@@ -92,20 +99,14 @@ class PlanRunner:
                     f"Expected: {step.expected_result}"
                 )
 
-            # --------------------------------------------------
-            # Execute one high-level step
-            # --------------------------------------------------
-
-            result = await self._run_step(step)
+            result = await self._run_step(
+                step=step,
+                site=plan.site,
+            )
 
             results.append(result)
 
-            # --------------------------------------------------
-            # Stop immediately on failure
-            # --------------------------------------------------
-
             if not result.finished:
-
                 print()
                 print(
                     f"PLAN FAILED AT STEP "
@@ -124,10 +125,6 @@ class PlanRunner:
                     ),
                 )
 
-        # ------------------------------------------------------
-        # Build final result
-        # ------------------------------------------------------
-
         final_result = self._build_final_result(
             results
         )
@@ -136,8 +133,9 @@ class PlanRunner:
         print("=" * 70)
         print("BROWSER PLAN COMPLETED")
         print("=" * 70)
-
-        print(f"Result: {final_result}")
+        print(
+            f"Result: {final_result}"
+        )
 
         return PlanRunResult(
             goal=plan.goal,
@@ -147,20 +145,12 @@ class PlanRunner:
             final_result=final_result,
         )
 
-    # ==========================================================
-    # VALIDATE PLAN
-    # ==========================================================
-
     @staticmethod
     def _validate_plan(
         plan: BrowserPlan,
     ) -> None:
         """
-        Validate structural properties required by PlanRunner.
-
-        BrowserPlan already validates the Pydantic schema.
-
-        This method validates execution-specific invariants.
+        Validate execution-specific plan invariants.
         """
 
         if not plan.steps:
@@ -171,7 +161,6 @@ class PlanRunner:
         expected_step_id = 1
 
         for step in plan.steps:
-
             if step.step_id != expected_step_id:
                 raise ValueError(
                     "Invalid plan step ordering: "
@@ -182,34 +171,45 @@ class PlanRunner:
 
             expected_step_id += 1
 
-    # ==========================================================
-    # RUN SINGLE PLAN STEP
-    # ==========================================================
-
     async def _run_step(
         self,
         step: PlanStep,
+        site: str,
     ) -> PlanStepResult:
+
+        if step.action == "login":
+            return await self._run_login_step(
+                step=step,
+                site=site,
+            )
+
+        return await self._run_browser_step(
+            step=step,
+        )
+
+    async def _run_browser_step(
+        self,
+        step: PlanStep,
+    ) -> PlanStepResult:
+        """
+        Execute navigate/search/extract using BrowserAgent.
+
+        Credentials are never passed here.
+        """
 
         task = self._build_subtask(step)
 
         print()
         print("Running browser agent...")
 
-        # ------------------------------------------------------
-        # Execute browser agent
-        # ------------------------------------------------------
-
         try:
-
             state = await self.browser_agent.run(
                 task
             )
 
-        except Exception as exc:
-
+        except Exception:
             print(
-                f"\nSTEP ERROR: {exc}"
+                "\nSTEP ERROR: Browser agent execution failed."
             )
 
             return PlanStepResult(
@@ -217,12 +217,8 @@ class PlanRunner:
                 action=step.action,
                 description=step.description,
                 finished=False,
-                error=str(exc),
+                error="Browser agent execution failed.",
             )
-
-        # ------------------------------------------------------
-        # Extract final browser state
-        # ------------------------------------------------------
 
         final_url = None
         final_title = None
@@ -235,7 +231,6 @@ class PlanRunner:
         )
 
         if observation:
-
             final_url = getattr(
                 observation,
                 "url",
@@ -248,19 +243,12 @@ class PlanRunner:
                 None,
             )
 
-            # Only EXTRACT steps expose page text
-            # as the extracted result.
             if step.action == "extract":
-
                 extracted_text = getattr(
                     observation,
                     "text",
                     None,
                 )
-
-        # ------------------------------------------------------
-        # Determine success
-        # ------------------------------------------------------
 
         finished = getattr(
             state,
@@ -275,7 +263,6 @@ class PlanRunner:
         )
 
         if not finished:
-
             return PlanStepResult(
                 step_id=step.step_id,
                 action=step.action,
@@ -287,13 +274,9 @@ class PlanRunner:
                 error=(
                     error
                     or "Browser agent did not finish "
-                       "the subtask"
+                    "the subtask"
                 ),
             )
-
-        # ------------------------------------------------------
-        # Successful step
-        # ------------------------------------------------------
 
         return PlanStepResult(
             step_id=step.step_id,
@@ -306,19 +289,57 @@ class PlanRunner:
             error=error,
         )
 
-    # ==========================================================
-    # BUILD SUBTASK
-    # ==========================================================
+    async def _run_login_step(
+        self,
+        step: PlanStep,
+        site: str,
+    ) -> PlanStepResult:
+        """
+        Execute authentication through SecureLoginHandler.
+
+        No credential material enters this method.
+        """
+
+        print()
+        print("Running secure login handler...")
+
+        try:
+            await self.login_handler.login(
+                site=site,
+            )
+
+            print(
+                "Secure login completed."
+            )
+
+            return PlanStepResult(
+                step_id=step.step_id,
+                action=step.action,
+                description=step.description,
+                finished=True,
+            )
+
+        except Exception:
+            print(
+                "Secure login failed."
+            )
+
+            return PlanStepResult(
+                step_id=step.step_id,
+                action=step.action,
+                description=step.description,
+                finished=False,
+                error="Secure login execution failed.",
+            )
 
     @staticmethod
     def _build_subtask(
         step: PlanStep,
     ) -> str:
         """
-        Convert a high-level PlanStep into a task
-        that BrowserAgent can execute.
+        Convert a high-level PlanStep into a BrowserAgent task.
 
-        PlanRunner does not perform browser operations itself.
+        Login steps never reach this method.
         """
 
         return f"""
@@ -326,40 +347,59 @@ You are executing ONE subtask of a larger
 browser automation plan.
 
 HIGH-LEVEL ACTION:
+
 {step.action}
 
 SUBTASK:
+
 {step.description}
 
 TARGET:
+
 {step.target or "Not specified"}
 
 EXPECTED RESULT:
+
 {step.expected_result or "Not specified"}
 
 IMPORTANT RULES:
 
 1. Complete ONLY this subtask.
+
 2. Do not perform unrelated actions.
+
 3. Use the browser observation and available
    browser tools.
+
 4. Continue until the requested subtask is
    actually complete.
+
 5. When the subtask is complete, return the
    "done" action.
+
 6. If the requested result cannot be found,
    clearly report the failure instead of
    pretending the task succeeded.
+
 7. Do not attempt the next plan step.
+
+8. Never request, invent, infer, or expose
+   authentication credentials.
+
+9. If the site requires authentication and the
+   current subtask cannot proceed without it,
+   report that authentication is required.
 
 ACTION-SPECIFIC INSTRUCTIONS:
 
 NAVIGATE:
+
 - Open the requested website or page.
 - Verify that the destination has loaded.
 - Stop once the destination is available.
 
 SEARCH:
+
 - Locate the requested information.
 - Use the site's search or navigation interface
   when appropriate.
@@ -369,6 +409,7 @@ SEARCH:
   has been located.
 
 EXTRACT:
+
 - Find the requested information.
 - Read the relevant visible information.
 - Capture the requested information from
@@ -385,10 +426,6 @@ this subtask.
 Do not attempt the next plan step.
 """
 
-    # ==========================================================
-    # BUILD FINAL RESULT
-    # ==========================================================
-
     @staticmethod
     def _build_final_result(
         results: list[PlanStepResult],
@@ -397,25 +434,13 @@ Do not attempt the next plan step.
         if not results:
             return None
 
-        # ------------------------------------------------------
-        # Prefer successful extraction
-        # ------------------------------------------------------
-
         for result in reversed(results):
-
             if (
                 result.action == "extract"
                 and result.finished
                 and result.extracted_text
             ):
                 return result.extracted_text
-
-        # ------------------------------------------------------
-        # No extraction step
-        #
-        # Return useful information about the final
-        # successful browser state.
-        # ------------------------------------------------------
 
         last_result = results[-1]
 
@@ -438,4 +463,3 @@ Do not attempt the next plan step.
             )
 
         return None
-

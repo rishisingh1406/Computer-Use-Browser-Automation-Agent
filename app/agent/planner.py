@@ -11,6 +11,7 @@ from app.agent.models import (
     PlanStep,
 )
 
+
 load_dotenv()
 
 
@@ -28,15 +29,24 @@ class PerSitePlanner:
         - type text
         - scroll
         - execute browser actions
+        - access credentials
 
-    Execution is handled by PlanRunner and BrowserAgent.
+    Authentication is represented only as a high-level
+    `login` step.
+
+    The trusted execution layer is responsible for:
+        - obtaining credentials
+        - obtaining trusted site login configuration
+        - injecting credentials into the browser
+
+    Credentials and authentication selectors must never
+    enter the LLM context.
     """
 
     DEFAULT_MODEL = "qwen/qwen3.6-27b"
 
     MAX_RETRIES = 3
 
-    # Used when Groq does not expose a retry delay directly.
     DEFAULT_RETRY_DELAY = 1.0
 
     def __init__(
@@ -74,12 +84,21 @@ class PerSitePlanner:
         """
         Generate and validate a high-level browser plan.
 
-        The planner is deliberately constrained to three
-        high-level actions:
+        Allowed high-level actions:
 
-            navigate -> search -> extract
+            navigate
+            login
+            search
+            extract
 
-        Low-level browser operations are handled elsewhere.
+        Authentication is intentionally represented only by
+        the high-level `login` action.
+
+        The planner NEVER receives:
+            - usernames
+            - passwords
+            - credential environment variables
+            - login selectors
         """
 
         # ------------------------------------------------------
@@ -101,12 +120,6 @@ class PerSitePlanner:
 
         # ------------------------------------------------------
         # System prompt
-        #
-        # IMPORTANT:
-        # Keep the JSON schema extremely simple.
-        #
-        # Groq's json_object mode can reject generation when
-        # the model fails to produce a valid JSON object.
         # ------------------------------------------------------
 
         system_prompt = """
@@ -120,6 +133,7 @@ You decide WHAT needs to happen, not HOW the browser performs it.
 Allowed actions:
 
 - navigate
+- login
 - search
 - extract
 
@@ -133,26 +147,46 @@ Never use:
 - wait
 - done
 
+Authentication rules:
+
+1. Use `login` when the requested information requires
+   authentication.
+2. The login step must contain only a high-level description
+   of authentication.
+3. The login target may identify the supplied website/domain.
+4. NEVER include usernames.
+5. NEVER include passwords.
+6. NEVER include credential values.
+7. NEVER include environment-variable values.
+8. NEVER include CSS selectors.
+9. NEVER describe how to fill username/password fields.
+10. NEVER invent authentication credentials.
+11. NEVER ask the user to provide credentials as part of
+    the generated plan.
+
 Planning rules:
 
 1. Use sequential step_id values starting at 1.
-2. Use only navigate, search, and extract.
+2. Use only navigate, login, search, and extract.
 3. Start with navigate when the website must be opened.
-4. Use search when information must be located.
-5. Use extract for the requested final information.
-6. For information retrieval, extract must be the final step.
-7. Keep the plan as small as reliably possible.
-8. Do not describe low-level browser operations.
-9. Do not invent website information.
-10. Preserve the supplied goal exactly.
-11. Preserve the supplied site exactly.
-12. Every step must have a useful description.
-13. target identifies the relevant page or information.
-14. expected_result describes the successful outcome.
-15. Return exactly one JSON object.
-16. Do not return markdown.
-17. Do not return explanations.
-18. Do not return code fences.
+4. If authentication is required, place exactly one login
+   step after navigation and before search/extract.
+5. Use search when information must be located.
+6. Use extract for the requested final information.
+7. For information retrieval, extract must be the final step.
+8. Keep the plan as small as reliably possible.
+9. Do not describe low-level browser operations.
+10. Do not invent website information.
+11. Preserve the supplied goal exactly.
+12. Preserve the supplied site exactly.
+13. Every step must have a useful description.
+14. target identifies the relevant page, website, domain,
+    or information.
+15. expected_result describes the successful outcome.
+16. Return exactly one JSON object.
+17. Do not return markdown.
+18. Do not return explanations.
+19. Do not return code fences.
 
 The JSON object must have this structure:
 
@@ -169,6 +203,36 @@ The JSON object must have this structure:
     }
   ]
 }
+
+For an authenticated website, a valid plan may look like:
+
+{
+  "goal": "the supplied goal",
+  "site": "the supplied site",
+  "steps": [
+    {
+      "step_id": 1,
+      "action": "navigate",
+      "description": "open the website",
+      "target": "the supplied website",
+      "expected_result": "the website is open"
+    },
+    {
+      "step_id": 2,
+      "action": "login",
+      "description": "authenticate using the site's configured test account",
+      "target": "the supplied website",
+      "expected_result": "the authenticated area is available"
+    },
+    {
+      "step_id": 3,
+      "action": "extract",
+      "description": "extract the requested information",
+      "target": "the requested information",
+      "expected_result": "the requested information is available"
+    }
+  ]
+}
 """.strip()
 
         # ------------------------------------------------------
@@ -180,8 +244,13 @@ The JSON object must have this structure:
             f"USER GOAL:\n{goal}\n\n"
             "Create the smallest reliable high-level plan "
             "required to accomplish this goal on this website.\n\n"
-            "For information retrieval, normally use:\n"
+            "If the goal requires authentication, include "
+            "exactly one login step after navigation.\n\n"
+            "For normal public information retrieval, normally use:\n"
             "navigate -> search -> extract\n\n"
+            "For authenticated information retrieval, normally use:\n"
+            "navigate -> login -> search -> extract\n\n"
+            "Do not include credentials or authentication selectors.\n\n"
             "Only include necessary steps.\n\n"
             "Return exactly one JSON object."
         )
@@ -233,6 +302,7 @@ The JSON object must have this structure:
             plan = BrowserPlan.model_validate(
                 data
             )
+
         except Exception as exc:
             raise ValueError(
                 "Groq returned an invalid browser plan: "
@@ -387,15 +457,13 @@ The JSON object must have this structure:
                         raise RuntimeError(
                             "Planner LLM request failed after "
                             f"{self.MAX_RETRIES + 1} attempts "
-                            "because of Groq rate limiting: "
-                            f"{exc}"
+                            "because of Groq rate limiting."
                         ) from exc
 
                     delay = self._extract_retry_delay(
                         exc
                     )
 
-                    # Progressive backoff.
                     delay += attempt * 0.5
 
                     print()
@@ -578,7 +646,7 @@ The JSON object must have this structure:
         site: str,
     ) -> None:
         """
-        Validate the planner output beyond Pydantic validation.
+        Validate planner output beyond Pydantic validation.
 
         This protects the execution layer from malformed or
         logically unsafe plans.
@@ -639,6 +707,7 @@ The JSON object must have this structure:
 
         allowed_actions = {
             "navigate",
+            "login",
             "search",
             "extract",
         }
@@ -670,6 +739,7 @@ The JSON object must have this structure:
 
             if step.action in {
                 "navigate",
+                "login",
                 "search",
             }:
 
@@ -683,6 +753,46 @@ The JSON object must have this structure:
                     )
 
             # --------------------------------------------------
+            # Login security validation
+            # --------------------------------------------------
+
+            if step.action == "login":
+
+                description_lower = (
+                    step.description.lower()
+                )
+
+                target_lower = (
+                    (step.target or "").lower()
+                )
+
+                forbidden_login_terms = {
+                    "password",
+                    "username",
+                    "credential",
+                    "secret",
+                    "token",
+                    "api key",
+                    "apikey",
+                    "selector",
+                    "css",
+                    "#password",
+                    "#username",
+                    "input[type",
+                }
+
+                for term in forbidden_login_terms:
+
+                    if (
+                        term in description_lower
+                        or term in target_lower
+                    ):
+                        raise ValueError(
+                            "Login step contains sensitive "
+                            "credential or selector information."
+                        )
+
+            # --------------------------------------------------
             # Expected result
             # --------------------------------------------------
 
@@ -693,6 +803,58 @@ The JSON object must have this structure:
                 raise ValueError(
                     f"Step {step.step_id} has "
                     "an empty expected_result."
+                )
+
+        # ------------------------------------------------------
+        # Login validation
+        # ------------------------------------------------------
+
+        login_indexes = [
+            index
+            for index, step in enumerate(
+                plan.steps
+            )
+            if step.action == "login"
+        ]
+
+        if len(login_indexes) > 1:
+            raise ValueError(
+                "A browser plan may contain at most "
+                "one login step."
+            )
+
+        if login_indexes:
+
+            login_index = login_indexes[0]
+
+            # Login must not be the first operation.
+            if login_index == 0:
+                raise ValueError(
+                    "The login step must occur after navigation."
+                )
+
+            # The first operation should be navigation.
+            if plan.steps[0].action != "navigate":
+                raise ValueError(
+                    "Authenticated plans must begin "
+                    "with navigation."
+                )
+
+            # Login must occur before extraction.
+            extract_indexes = [
+                index
+                for index, step in enumerate(
+                    plan.steps
+                )
+                if step.action == "extract"
+            ]
+
+            if (
+                extract_indexes
+                and login_index > extract_indexes[0]
+            ):
+                raise ValueError(
+                    "The login step must occur before extraction."
                 )
 
         # ------------------------------------------------------
