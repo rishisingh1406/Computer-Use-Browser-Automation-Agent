@@ -14,6 +14,25 @@ class CredentialProvider:
     LOGIN_CONFIGS registry, not from the LLM.
     """
 
+    @staticmethod
+    def _site_to_prefix(site: str) -> str:
+        """
+        Convert a site identifier into the conventional
+        environment-variable prefix.
+
+        Example:
+            github.com -> GITHUB_COM
+            saucedemo.com -> SAUCEDEMO_COM
+        """
+
+        return (
+            site.strip()
+            .lower()
+            .replace(".", "_")
+            .replace("-", "_")
+            .upper()
+        )
+
     def get_credentials(
         self,
         site: str,

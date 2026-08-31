@@ -48,7 +48,7 @@ class PlanRunner:
     def __init__(
         self,
         browser_agent: BrowserAgent,
-        login_handler: SecureLoginHandler,
+        login_handler: SecureLoginHandler | None = None,
     ):
         self.browser_agent = browser_agent
         self.login_handler = login_handler
@@ -125,17 +125,13 @@ class PlanRunner:
                     ),
                 )
 
-        final_result = self._build_final_result(
-            results
-        )
+        final_result = self._build_final_result(results)
 
         print()
         print("=" * 70)
         print("BROWSER PLAN COMPLETED")
         print("=" * 70)
-        print(
-            f"Result: {final_result}"
-        )
+        print(f"Result: {final_result}")
 
         return PlanRunResult(
             goal=plan.goal,
@@ -203,11 +199,9 @@ class PlanRunner:
         print("Running browser agent...")
 
         try:
-            state = await self.browser_agent.run(
-                task
-            )
+            state = await self.browser_agent.run(task)
 
-        except Exception:
+        except Exception as exc:
             print(
                 "\nSTEP ERROR: Browser agent execution failed."
             )
@@ -217,7 +211,7 @@ class PlanRunner:
                 action=step.action,
                 description=step.description,
                 finished=False,
-                error="Browser agent execution failed.",
+                error=str(exc),
             )
 
         final_url = None
@@ -303,14 +297,24 @@ class PlanRunner:
         print()
         print("Running secure login handler...")
 
+        if self.login_handler is None:
+            return PlanStepResult(
+                step_id=step.step_id,
+                action=step.action,
+                description=step.description,
+                finished=False,
+                error=(
+                    "SecureLoginHandler is required "
+                    "for login steps."
+                ),
+            )
+
         try:
             await self.login_handler.login(
                 site=site,
             )
 
-            print(
-                "Secure login completed."
-            )
+            print("Secure login completed.")
 
             return PlanStepResult(
                 step_id=step.step_id,
@@ -320,9 +324,7 @@ class PlanRunner:
             )
 
         except Exception:
-            print(
-                "Secure login failed."
-            )
+            print("Secure login failed.")
 
             return PlanStepResult(
                 step_id=step.step_id,

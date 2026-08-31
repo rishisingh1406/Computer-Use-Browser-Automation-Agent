@@ -7,4 +7,5 @@ httpx
 pytest
 pytest-asyncio
 groq
-python-dotenv
+sqlalchemy
+psycopg[binary]
