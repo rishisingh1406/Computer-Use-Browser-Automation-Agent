@@ -13,6 +13,13 @@ class BrowserTools:
 
     These methods provide a controlled interface between
     the agent and Playwright.
+
+    Design principles:
+        - Playwright remains the execution layer.
+        - LLM never receives direct browser access.
+        - DOM selectors are preferred for deterministic actions.
+        - Coordinate actions are used for visual grounding.
+        - Security-sensitive elements can be inspected before execution.
     """
 
     def __init__(self, page: Page):
@@ -48,9 +55,22 @@ class BrowserTools:
         self,
         selector: str,
     ) -> dict:
-        """Click an element using a CSS selector."""
+        """
+        Click an element using a CSS selector.
 
-        locator = self.page.locator(selector)
+        This method intentionally performs only the browser action.
+        Security-sensitive actions should be inspected by the
+        security/guardrail layer before reaching this method.
+        """
+
+        locator = self.page.locator(
+            selector
+        ).first
+
+        if not await locator.count():
+            raise ValueError(
+                f"Element not found: {selector}"
+            )
 
         previous_url = self.page.url
 
@@ -88,7 +108,16 @@ class BrowserTools:
     ) -> dict:
         """Enter text into an input element."""
 
-        await self.page.locator(selector).fill(text)
+        locator = self.page.locator(
+            selector
+        ).first
+
+        if not await locator.count():
+            raise ValueError(
+                f"Element not found: {selector}"
+            )
+
+        await locator.fill(text)
 
         return {
             "action": "type",
@@ -108,8 +137,8 @@ class BrowserTools:
         """
         Capture the browser viewport.
 
-        For visual grounding, full_page=False is important because
-        VisionGrounder returns coordinates relative to the screenshot.
+        full_page=False is important for visual grounding because
+        VisionGrounder coordinates are relative to the screenshot.
         """
 
         output_path = Path(path)
@@ -171,22 +200,26 @@ class BrowserTools:
         """
         Click a point using screenshot coordinates.
 
-        VisionGrounder returns coordinates relative to the
-        screenshot.
+        VisionGrounder returns coordinates relative to the screenshot.
 
-        Playwright mouse.click() expects CSS viewport
-        coordinates.
+        Playwright mouse.click() expects CSS viewport coordinates.
 
         Therefore:
 
-            screenshot coordinates
+            screenshot pixels
                     ↓
             CSS viewport coordinates
                     ↓
-            Playwright mouse click
+            Playwright mouse.click()
 
-        The method also inspects the DOM element under the
-        coordinate and waits for navigation when appropriate.
+        The method also:
+
+            1. validates coordinates
+            2. inspects the DOM element under the point
+            3. detects whether the target is likely a link
+            4. performs exactly one click
+            5. waits for browser events to settle
+            6. returns structured diagnostics
         """
 
         # --------------------------------------------------------
@@ -196,11 +229,15 @@ class BrowserTools:
         try:
             x = float(x)
             y = float(y)
-
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 "x and y coordinates must be numeric."
             ) from exc
+
+        if x < 0 or y < 0:
+            raise ValueError(
+                "x and y coordinates must be non-negative."
+            )
 
         # --------------------------------------------------------
         # Browser viewport
@@ -229,6 +266,11 @@ class BrowserTools:
         device_pixel_ratio = float(
             viewport["devicePixelRatio"]
         )
+
+        if viewport_width <= 0 or viewport_height <= 0:
+            raise ValueError(
+                "Browser viewport dimensions are invalid."
+            )
 
         # --------------------------------------------------------
         # Determine actual screenshot dimensions
@@ -277,7 +319,7 @@ class BrowserTools:
         )
 
         # --------------------------------------------------------
-        # Validate coordinates
+        # Validate converted coordinates
         # --------------------------------------------------------
 
         if not (
@@ -317,8 +359,13 @@ class BrowserTools:
                 const target =
                     anchor || element;
 
+                const form =
+                    target.closest("form");
+
                 return {
-                    tag: target.tagName,
+                    tag: (
+                        target.tagName || ""
+                    ).toLowerCase(),
 
                     text: (
                         target.innerText ||
@@ -326,14 +373,38 @@ class BrowserTools:
                         ""
                     ).trim(),
 
-                    href: target.href || null,
+                    href:
+                        target.href ||
+                        null,
 
-                    id: target.id || null,
+                    id:
+                        target.id ||
+                        null,
 
                     className:
                         typeof target.className === "string"
                             ? target.className
-                            : null
+                            : null,
+
+                    role:
+                        target.getAttribute("role") ||
+                        null,
+
+                    aria_label:
+                        target.getAttribute("aria-label") ||
+                        null,
+
+                    type:
+                        target.getAttribute("type") ||
+                        null,
+
+                    name:
+                        target.getAttribute("name") ||
+                        null,
+
+                    form_action:
+                        form?.action ||
+                        null
                 };
             }
             """,
@@ -344,61 +415,14 @@ class BrowserTools:
         )
 
         # --------------------------------------------------------
-        # Diagnostics
-        # --------------------------------------------------------
-
-        print(
-            "\n--- COORDINATE CLICK ---"
-        )
-
-        print(
-            f"Input screenshot coordinates: "
-            f"({x:.2f}, {y:.2f})"
-        )
-
-        print(
-            f"Screenshot dimensions: "
-            f"{screenshot_width:.0f}x"
-            f"{screenshot_height:.0f}"
-        )
-
-        print(
-            f"Viewport dimensions: "
-            f"{viewport_width:.0f}x"
-            f"{viewport_height:.0f}"
-        )
-
-        print(
-            f"Device pixel ratio: "
-            f"{device_pixel_ratio:.2f}"
-        )
-
-        print(
-            f"Converted CSS coordinates: "
-            f"({css_x:.2f}, {css_y:.2f})"
-        )
-
-        print(
-            "\nELEMENT UNDER COORDINATE:"
-        )
-
-        print(
-            element_info
-        )
-
-        # --------------------------------------------------------
         # Current URL
         # --------------------------------------------------------
 
         previous_url = self.page.url
 
         # --------------------------------------------------------
-        # Click
+        # Determine navigation expectation
         # --------------------------------------------------------
-
-        print(
-            "\nCLICKING..."
-        )
 
         navigation_expected = bool(
             element_info
@@ -407,15 +431,16 @@ class BrowserTools:
 
         navigation_started = False
 
+        # --------------------------------------------------------
+        # Click exactly once
+        # --------------------------------------------------------
+
         if navigation_expected:
-
             try:
-
                 async with self.page.expect_navigation(
                     wait_until="domcontentloaded",
                     timeout=5000,
                 ):
-
                     await self.page.mouse.click(
                         css_x,
                         css_y,
@@ -423,22 +448,12 @@ class BrowserTools:
 
                 navigation_started = True
 
-            except Exception as exc:
-
-                print(
-                    "\nNavigation event was not "
-                    "observed:"
-                )
-
-                print(
-                    exc
-                )
-
-                # The mouse click itself may still have
-                # succeeded. Do not click a second time.
+            except Exception:
+                # The click itself may still have succeeded.
+                # Never click a second time.
+                navigation_started = False
 
         else:
-
             await self.page.mouse.click(
                 css_x,
                 css_y,
@@ -463,62 +478,23 @@ class BrowserTools:
         )
 
         # --------------------------------------------------------
-        # Diagnostics
-        # --------------------------------------------------------
-
-        print(
-            "\nCLICK RESULT:"
-        )
-
-        print(
-            f"Previous URL: {previous_url}"
-        )
-
-        print(
-            f"Final URL:    {final_url}"
-        )
-
-        print(
-            f"Navigation expected: "
-            f"{navigation_expected}"
-        )
-
-        print(
-            f"Navigation event detected: "
-            f"{navigation_started}"
-        )
-
-        print(
-            f"URL changed: "
-            f"{navigated}"
-        )
-
-        # --------------------------------------------------------
         # Return structured result
         # --------------------------------------------------------
 
         return {
             "action": "click_coordinates",
-
             "x": x,
             "y": y,
-
             "css_x": css_x,
             "css_y": css_y,
-
             "screenshot_width": screenshot_width,
             "screenshot_height": screenshot_height,
-
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
-
             "device_pixel_ratio": device_pixel_ratio,
-
             "element": element_info,
-
             "previous_url": previous_url,
             "url": final_url,
-
             "navigation_expected": navigation_expected,
             "navigation_started": navigation_started,
             "navigated": navigated,
@@ -534,27 +510,190 @@ class BrowserTools:
     ) -> dict:
         """Scroll the page up or down."""
 
-        if direction == "down":
+        direction = direction.lower().strip()
 
+        if direction == "down":
             await self.page.mouse.wheel(
                 0,
                 800,
             )
 
         elif direction == "up":
-
             await self.page.mouse.wheel(
                 0,
                 -800,
             )
 
         else:
-
             raise ValueError(
                 "direction must be 'up' or 'down'"
             )
 
+        await self.page.wait_for_timeout(
+            250
+        )
+
+        scroll_position = await self.page.evaluate(
+            """
+            () => ({
+                scrollX: window.scrollX,
+                scrollY: window.scrollY,
+                documentHeight:
+                    document.documentElement.scrollHeight,
+                viewportHeight:
+                    window.innerHeight
+            })
+            """
+        )
+
         return {
             "action": "scroll",
             "direction": direction,
+            "scroll": scroll_position,
         }
+
+    # ============================================================
+    # Inspect selector
+    # ============================================================
+
+    async def inspect_selector(
+        self,
+        selector: str,
+    ) -> dict:
+        """
+        Inspect a DOM element before executing an action.
+        """
+
+        locator = self.page.locator(
+            selector
+        ).first
+
+        if not await locator.count():
+            raise ValueError(
+                f"Element not found: {selector}"
+            )
+
+        return await locator.evaluate(
+            """
+            (element, selector) => {
+
+                const tag = (
+                    element.tagName || ""
+                ).toLowerCase();
+
+                const type = (
+                    element.getAttribute("type") || ""
+                ).toLowerCase();
+
+                const text = (
+                    element.innerText ||
+                    element.textContent ||
+                    ""
+                ).trim();
+
+                const ariaLabel = (
+                    element.getAttribute("aria-label") ||
+                    ""
+                ).trim();
+
+                const name = (
+                    element.getAttribute("name") ||
+                    ""
+                ).trim();
+
+                const value = (
+                    element.getAttribute("value") ||
+                    ""
+                ).trim();
+
+                const anchor =
+                    element.closest("a");
+
+                const href =
+                    anchor?.href ||
+                    element.href ||
+                    null;
+
+                const form =
+                    element.closest("form");
+
+                const formAction =
+                    form?.action ||
+                    null;
+
+                const dangerousWords = [
+                    "submit",
+                    "buy",
+                    "purchase",
+                    "place order",
+                    "confirm",
+                    "checkout",
+                    "pay",
+                    "send",
+                    "book",
+                    "reserve",
+                    "delete",
+                    "remove",
+                    "cancel",
+                    "transfer"
+                ];
+
+                const combinedText = [
+                    text,
+                    ariaLabel,
+                    name,
+                    value
+                ]
+                .join(" ")
+                .toLowerCase();
+
+                const isSubmitControl =
+                    (
+                        tag === "button" &&
+                        (
+                            type === "submit" ||
+                            type === "button"
+                        )
+                    )
+                    ||
+                    (
+                        tag === "input" &&
+                        (
+                            type === "submit" ||
+                            type === "button"
+                        )
+                    );
+
+                const hasDangerousText =
+                    dangerousWords.some(
+                        word =>
+                            combinedText.includes(word)
+                    );
+
+                const submitType =
+                    isSubmitControl ||
+                    hasDangerousText;
+
+                return {
+                    selector,
+                    tag,
+                    type,
+                    text,
+                    aria_label: ariaLabel,
+                    name,
+                    value,
+                    href,
+                    form_action: formAction,
+                    submit_type: submitType,
+                    description: (
+                        text ||
+                        ariaLabel ||
+                        name ||
+                        value ||
+                        selector
+                    )
+                };
+            }
+            """,
+            selector,
+        )
