@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from app.browser.manager import BrowserManager
 from app.browser.tools import BrowserTools
@@ -6,8 +7,12 @@ from app.browser.tools import BrowserTools
 
 async def main():
 
+    headless = (
+        os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
+    )
+
     manager = BrowserManager(
-        headless=False
+        headless=headless
     )
 
     try:

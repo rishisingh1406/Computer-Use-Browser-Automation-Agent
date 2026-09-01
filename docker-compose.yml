@@ -1,3 +1,4 @@
+```yaml
 services:
   postgres:
     image: postgres:16
@@ -20,5 +21,29 @@ services:
       timeout: 5s
       retries: 5
 
+  browser-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: browser_agent
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    volumes:
+      - ./screenshots:/app/screenshots
+
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/pricing_db
+
+    stdin_open: true
+    tty: true
+
 volumes:
   postgres_data:
+```

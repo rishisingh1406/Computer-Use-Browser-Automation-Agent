@@ -9,3 +9,4 @@ pytest-asyncio
 groq
 sqlalchemy
 psycopg[binary]
+Pillow
