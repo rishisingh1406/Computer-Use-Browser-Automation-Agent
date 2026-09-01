@@ -26,21 +26,40 @@ class GroqBrowserLLM:
     The high-level planner has already decided WHAT
     needs to happen.
 
-    This class decides the next concrete browser action.
+    Day 100:
+        Supports self-correction by receiving failure feedback
+        from BrowserAgent after a browser action fails.
+
+    Important architecture:
+
+        BrowserAgent
+              |
+              v
+        Perception
+              |
+              v
+        GroqBrowserLLM
+              |
+              v
+        BrowserAction
+              |
+              v
+        ActionExecutor
+
+    The LLM proposes an action.
+
+    It does NOT execute browser operations directly.
     """
 
     DEFAULT_MODEL = "qwen/qwen3.6-27b"
 
-    # Maximum number of retries after the first request.
+    # Maximum number of retries after the first Groq request.
     MAX_RETRIES = 2
 
     # Delay between browser LLM requests.
-    #
-    # This is NOT a fix for daily token limits.
-    # It simply prevents sending requests too aggressively.
     REQUEST_DELAY = 1.0
 
-    # Initial retry delay.
+    # Initial retry delay for transient/API failures.
     DEFAULT_RETRY_DELAY = 1.0
 
     # Maximum visible text sent to the model.
@@ -110,8 +129,12 @@ class GroqBrowserLLM:
         """
         Small, strict prompt.
 
-        Keep this prompt compact because it is sent
-        on every browser step.
+        The model receives this prompt on every browser step.
+
+        Day 100:
+            Explicitly defines recovery behavior so the model
+            understands that a failed action must not simply
+            be repeated blindly.
         """
 
         return """
@@ -153,6 +176,19 @@ Rules:
 8. Use the current URL, title, visible text and screenshot.
 9. Never invent browser state.
 10. Return done ONLY when the current subtask is actually complete.
+
+SELF-CORRECTION RULES:
+
+11. A previous browser action may have failed.
+12. If failure feedback is provided, treat the failed action as unreliable.
+13. Do NOT blindly repeat the same failed selector or action.
+14. Re-evaluate the fresh browser observation before choosing an action.
+15. Prefer a different grounded selector or interaction strategy.
+16. If the page changed, use the new page state rather than the old state.
+17. Only repeat an action when the fresh observation provides a clear reason that it is now valid.
+18. The recovery action must still accomplish the CURRENT SUBTASK.
+19. Do not guess selectors that are unsupported by the current observation.
+20. Never claim success unless the current browser state supports it.
 
 Action requirements:
 
@@ -201,16 +237,39 @@ Return ONLY the JSON object.
     def _build_user_prompt(
         task: str,
         observation: BrowserObservation,
+        failure_feedback: str | None = None,
     ) -> str:
         """
         Build a compact browser-state prompt.
 
-        Keep this small because it is sent repeatedly.
+        Day 100:
+            Includes failure feedback when the previous action
+            failed so the model can choose a recovery strategy.
         """
 
         visible_text = observation.text[
             : GroqBrowserLLM.MAX_VISIBLE_TEXT
         ]
+
+        recovery_section = ""
+
+        if failure_feedback:
+            recovery_section = f"""
+
+SELF-CORRECTION / RECOVERY CONTEXT:
+
+{failure_feedback}
+
+IMPORTANT:
+
+The browser has been re-observed after the failed action.
+
+Use the NEW browser observation below as the source of truth.
+
+Do NOT blindly repeat the failed selector or action.
+
+Choose a different grounded approach when possible.
+"""
 
         return f"""
 CURRENT SUBTASK:
@@ -227,6 +286,7 @@ TITLE:
 
 VISIBLE TEXT:
 {visible_text}
+{recovery_section}
 
 Determine the SINGLE best next browser action.
 
@@ -305,12 +365,7 @@ set it to null.
         exc: Exception,
     ) -> bool:
         """
-        Detect Groq 400 JSON validation failures.
-
-        Example:
-
-        Failed to validate JSON.
-        Please adjust your prompt.
+        Detect Groq JSON validation failures.
         """
 
         message = GroqBrowserLLM._error_message(exc)
@@ -373,12 +428,6 @@ set it to null.
         ):
             try:
 
-                # --------------------------------------------------
-                # Small delay before every request after the first.
-                #
-                # This reduces burst pressure on RPM/TPM limits.
-                # --------------------------------------------------
-
                 if attempt > 0:
                     delay = (
                         self.DEFAULT_RETRY_DELAY
@@ -401,39 +450,20 @@ set it to null.
                         delay
                     )
 
-                # --------------------------------------------------
-                # Request
-                # --------------------------------------------------
-
                 response = (
                     self.client
                     .chat
                     .completions
                     .create(
                         model=self.model,
-
                         temperature=0,
-
-                        # Qwen 3.6 supports reasoning_effort="none".
-                        #
-                        # This is appropriate here because this model
-                        # only needs to choose one browser action.
                         reasoning_effort="none",
-
                         response_format={
                             "type": "json_object"
                         },
-
                         messages=messages,
                     )
                 )
-
-                # --------------------------------------------------
-                # Small cooldown after successful request.
-                #
-                # This helps avoid hammering the API when the
-                # BrowserAgent immediately asks for another action.
-                # --------------------------------------------------
 
                 await asyncio.sleep(
                     self.REQUEST_DELAY
@@ -455,8 +485,8 @@ set it to null.
                         exc
                     )
 
-                    # Daily token limits are not fixed by
-                    # sleeping for one or two seconds.
+                    # Daily token limits should not be
+                    # blindly retried.
                     if (
                         "tokens per day" in message
                         or "tpd" in message
@@ -469,7 +499,6 @@ set it to null.
                             f"Original error: {exc}"
                         ) from exc
 
-                    # TPM/RPM limits may recover.
                     if attempt < self.MAX_RETRIES:
 
                         retry_delay = max(
@@ -615,9 +644,20 @@ set it to null.
         self,
         task: str,
         observation: BrowserObservation,
+        failure_feedback: str | None = None,
     ) -> BrowserAction:
         """
         Decide the single next browser action.
+
+        Day 100:
+            failure_feedback contains information about the
+            previous failed browser action.
+
+            The browser state has already been re-observed
+            by BrowserAgent before this method is called.
+
+        This method never executes the action.
+        It only proposes a validated BrowserAction.
         """
 
         # ------------------------------------------------------
@@ -629,6 +669,18 @@ set it to null.
         if not task:
             raise ValueError(
                 "Browser task cannot be empty."
+            )
+
+        # ------------------------------------------------------
+        # Validate observation
+        # ------------------------------------------------------
+
+        if not isinstance(
+            observation,
+            BrowserObservation,
+        ):
+            raise TypeError(
+                "observation must be a BrowserObservation."
             )
 
         # ------------------------------------------------------
@@ -651,6 +703,7 @@ set it to null.
             self._build_user_prompt(
                 task=task,
                 observation=observation,
+                failure_feedback=failure_feedback,
             )
         )
 
@@ -964,4 +1017,3 @@ set it to null.
                 raise ValueError(
                     "done action must not contain direction."
                 )
-

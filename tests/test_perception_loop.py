@@ -13,7 +13,22 @@ class FakeLLM:
     def __init__(self):
         self.calls = 0
 
-    async def decide(self, task, observation):
+    async def decide(
+        self,
+        task,
+        observation,
+        failure_feedback=None,
+    ):
+        """
+        Fake LLM used for testing the perception-action loop.
+
+        Day 100 compatibility:
+            failure_feedback is accepted so the fake model
+            matches the production BrowserAgent LLM interface.
+
+        This test does not need to use failure_feedback because
+        it tests the normal successful perception-action path.
+        """
 
         self.calls += 1
 
@@ -35,30 +50,37 @@ async def test_perception_action_loop():
 
     manager = BrowserManager(headless=True)
 
-    page = await manager.start()
+    try:
+        page = await manager.start()
 
-    tools = BrowserTools(page)
+        tools = BrowserTools(page)
 
-    perception = Perception(tools)
+        perception = Perception(tools)
 
-    executor = ActionExecutor(tools)
+        executor = ActionExecutor(tools)
 
-    llm = FakeLLM()
+        llm = FakeLLM()
 
-    agent = BrowserAgent(
-        llm=llm,
-        perception=perception,
-        executor=executor,
-        max_steps=5,
-    )
+        agent = BrowserAgent(
+            llm=llm,
+            perception=perception,
+            executor=executor,
+            max_steps=5,
+        )
 
-    state = await agent.run(
-        "Open example.com"
-    )
+        state = await agent.run(
+            "Open example.com"
+        )
 
-    assert state.finished is True
-    assert state.step == 2
-    assert state.observation is not None
-    assert state.observation.title == "Example Domain"
+        assert state.finished is True
+        assert state.step == 2
+        assert state.observation is not None
+        assert state.observation.title == "Example Domain"
 
-    await manager.close()
+        # The fake LLM should have been called twice:
+        # 1. Navigate to example.com
+        # 2. Mark the task as done
+        assert llm.calls == 2
+
+    finally:
+        await manager.close()
